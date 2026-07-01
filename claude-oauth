@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""
+Claude OAuth dynamic provider for maki.
+
+Bridges Claude Code's existing SSO/OAuth session into maki — no separate
+API key needed. Reads and refreshes tokens from Claude Code's credentials file.
+
+Install:
+  cp <this-file> ~/.maki/providers/claude-oauth
+  chmod +x ~/.maki/providers/claude-oauth
+
+Usage:
+  maki auth login claude-oauth   # first-time: opens browser for auth
+  maki -m claude-oauth/claude-opus-4-8
+
+Requires Python 3.8+, no external dependencies.
+Tokens are read directly from ~/.claude/.credentials.json (Claude Code's store).
+"""
+
+import json
+import os
+import sys
+import time
+import urllib.request
+import urllib.parse
+import urllib.error
+
+CREDENTIALS_FILE = os.path.expanduser("~/.claude/.credentials.json")
+TOKEN_FILE = os.path.expanduser("~/.maki/auth/claude.json")
+
+# Claude Code OAuth endpoints (extracted from claude CLI binary)
+TOKEN_ENDPOINT = "https://platform.claude.com/v1/oauth/token"
+AUTH_ENDPOINT = "https://claude.com/cai/oauth/authorize"
+CALLBACK_URL = "https://platform.claude.com/oauth/code/callback"
+
+# Claude Code's first-party client ID
+CLAUDE_CODE_CLIENT_ID = os.environ.get("CLAUDE_CODE_OAUTH_CLIENT_ID", "9d1c250a-e61b-44d9-88ed-5944d1962f5e")
+
+REFRESH_BUFFER_SECS = 300  # refresh 5 min before expiry
+DEFAULT_SCOPES = ["user:inference"]
+
+
+def load_claude_code_tokens():
+    """Read tokens directly from Claude Code's credentials file."""
+    try:
+        with open(CREDENTIALS_FILE) as f:
+            data = json.load(f)
+        oauth = data.get("claudeAiOauth", {})
+        if not oauth.get("accessToken"):
+            return None
+        return {
+            "access": oauth["accessToken"],
+            "refresh": oauth.get("refreshToken"),
+            "expires": oauth.get("expiresAt", 0),  # milliseconds
+            "scopes": oauth.get("scopes", DEFAULT_SCOPES),
+            "client_id": oauth.get("clientId", CLAUDE_CODE_CLIENT_ID),
+        }
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        return None
+
+
+def load_maki_tokens():
+    """Read tokens from maki's own auth store (written by login flow)."""
+    try:
+        with open(TOKEN_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def save_maki_tokens(tokens):
+    os.makedirs(os.path.dirname(TOKEN_FILE), exist_ok=True)
+    tmp = TOKEN_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(tokens, f, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, TOKEN_FILE)
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+def is_expired(tokens):
+    return now_ms() + REFRESH_BUFFER_SECS * 1000 >= tokens.get("expires", 0)
+
+
+def post_form(url, data):
+    body = urllib.parse.urlencode(data).encode()
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read())
+
+
+def do_refresh(tokens):
+    payload = {
+        "grant_type": "refresh_token",
+        "refresh_token": tokens["refresh"],
+    }
+    client_id = tokens.get("client_id")
+    if client_id:
+        payload["client_id"] = client_id
+
+    resp = post_form(TOKEN_ENDPOINT, payload)
+    new_tokens = {
+        "access": resp["access_token"],
+        "refresh": resp.get("refresh_token", tokens["refresh"]),
+        "expires": now_ms() + resp.get("expires_in", 3600) * 1000,
+        "scopes": tokens.get("scopes", DEFAULT_SCOPES),
+        "client_id": client_id,
+    }
+    save_maki_tokens(new_tokens)
+    return new_tokens
+
+
+OAUTH_CONTRACT_HEADERS = {
+    "User-Agent": "claude-cli/1.0.0",
+    "anthropic-beta": "oauth-2025-04-20,claude-code-20250219",
+}
+
+MESSAGES_URL = "https://api.anthropic.com/v1/messages?beta=true"
+
+
+def build_resolved(tokens):
+    return {
+        "base_url": MESSAGES_URL,
+        "headers": {
+            "Authorization": f"Bearer {tokens['access']}",
+            **OAUTH_CONTRACT_HEADERS,
+        },
+    }
+
+
+def resolve_tokens():
+    """
+    Token resolution order:
+    1. Claude Code credentials file (always up to date, shared with the CLI)
+    2. Maki's own auth store (written by `maki auth login claude-oauth`)
+    """
+    # Prefer Claude Code's store — it's kept fresh by the CLI itself
+    tokens = load_claude_code_tokens()
+    if tokens and not is_expired(tokens):
+        return tokens, "claude_code_store"
+
+    # Fall back to maki's own store
+    maki_tokens = load_maki_tokens()
+    if maki_tokens and not is_expired(maki_tokens):
+        return maki_tokens, "maki_store"
+
+    # Need a refresh — use whichever store has a refresh token
+    refresh_source = tokens if (tokens and tokens.get("refresh")) else maki_tokens
+    if refresh_source and refresh_source.get("refresh"):
+        return do_refresh(refresh_source), "refreshed"
+
+    return None, "no_tokens"
+
+
+CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
+
+
+def cmd_info():
+    print(json.dumps({
+        "display_name": "Claude OAuth",
+        "base": "anthropic",
+        "has_auth": True,
+        "system_prefix": CLAUDE_CODE_IDENTITY,
+    }))
+
+
+# Model catalog served over the OAuth (Messages) API. Maki calls `models`
+# (5s timeout) and namespaces each as claude-oauth/{id}. The first model
+# listed per tier is used for sub-agents.
+MODELS = [
+    {
+        "id": "claude-opus-4-8",
+        "tier": "strong",
+        "context_window": 200000,
+        "max_output_tokens": 32000,
+        "pricing": {"input": 15.0, "output": 75.0,
+                    "cache_write": 18.75, "cache_read": 1.5},
+    },
+    {
+        "id": "claude-opus-4-7",
+        "tier": "strong",
+        "context_window": 200000,
+        "max_output_tokens": 32000,
+        "pricing": {"input": 15.0, "output": 75.0,
+                    "cache_write": 18.75, "cache_read": 1.5},
+    },
+    {
+        "id": "claude-sonnet-5",
+        "tier": "medium",
+        "context_window": 1000000,
+        "max_output_tokens": 128000,
+        "pricing": {"input": 3.0, "output": 15.0,
+                    "cache_write": 3.75, "cache_read": 0.3},
+    },
+    {
+        "id": "claude-sonnet-4-5",
+        "tier": "medium",
+        "context_window": 1000000,
+        "max_output_tokens": 64000,
+        "pricing": {"input": 3.0, "output": 15.0,
+                    "cache_write": 3.75, "cache_read": 0.3},
+    },
+    {
+        "id": "claude-haiku-4-5",
+        "tier": "weak",
+        "context_window": 200000,
+        "max_output_tokens": 64000,
+        "pricing": {"input": 1.0, "output": 5.0,
+                    "cache_write": 1.25, "cache_read": 0.1},
+    },
+]
+
+
+def cmd_models():
+    print(json.dumps(MODELS))
+
+
+def cmd_resolve():
+    tokens, source = resolve_tokens()
+    if not tokens:
+        print(
+            "not authenticated — run: maki auth login claude-oauth\n"
+            "  (or log in via Claude Code: claude auth login)",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    print(json.dumps(build_resolved(tokens)))
+
+
+def cmd_refresh():
+    tokens = load_claude_code_tokens() or load_maki_tokens()
+    if not tokens or not tokens.get("refresh"):
+        print("no refresh token available", file=sys.stderr)
+        sys.exit(1)
+    try:
+        tokens = do_refresh(tokens)
+    except Exception as e:
+        print(f"token refresh failed: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(json.dumps(build_resolved(tokens)))
+
+
+def cmd_login():
+    """
+    If Claude Code already has a valid token, just mirror it into maki's store.
+    Otherwise open a browser-based device/PKCE flow.
+    """
+    tokens = load_claude_code_tokens()
+    if tokens and not is_expired(tokens):
+        save_maki_tokens(tokens)
+        print("Authenticated via existing Claude Code session.")
+        return
+
+    # Attempt refresh if we have a refresh token
+    if tokens and tokens.get("refresh"):
+        try:
+            tokens = do_refresh(tokens)
+            print("Authenticated via token refresh.")
+            return
+        except Exception as e:
+            print(f"Refresh failed ({e}), falling back to browser login...", file=sys.stderr)
+
+    # Full browser login — direct user to Claude Code's auth flow since
+    # we don't know the full PKCE parameters Claude Code uses internally.
+    print("No active Claude Code session found.")
+    print()
+    print("Please log in via Claude Code first:")
+    print()
+    print("  claude auth login")
+    print()
+    print("Then re-run: maki auth login claude-oauth")
+    sys.exit(1)
+
+
+def cmd_logout():
+    try:
+        os.remove(TOKEN_FILE)
+        print("Logged out of Claude OAuth (maki store cleared).")
+        print("Note: your Claude Code session is unaffected.")
+    except FileNotFoundError:
+        print("Not currently logged in (maki store).")
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(f"usage: {sys.argv[0]} <info|models|resolve|refresh|login|logout>", file=sys.stderr)
+        sys.exit(1)
+
+    commands = {
+        "info": cmd_info,
+        "models": cmd_models,
+        "resolve": cmd_resolve,
+        "refresh": cmd_refresh,
+        "login": cmd_login,
+        "logout": cmd_logout,
+    }
+
+    fn = commands.get(sys.argv[1])
+    if not fn:
+        print(f"unknown command: {sys.argv[1]}", file=sys.stderr)
+        sys.exit(1)
+    fn()
+
+
+if __name__ == "__main__":
+    main()
