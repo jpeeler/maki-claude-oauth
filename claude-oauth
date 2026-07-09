@@ -13,6 +13,12 @@ Usage:
   maki auth login claude-oauth   # first-time: opens browser for auth
   maki -m claude-oauth/claude-opus-4-8
 
+To route requests through a gateway (e.g. Aperture by Tailscale) instead of
+hitting api.anthropic.com directly, set:
+  export CLAUDE_OAUTH_BASE_URL="http://<aperture-hostname>"
+Requires the upstream Anthropic provider on the gateway to be configured
+in passthrough auth_mode, since the OAuth token is forwarded as-is.
+
 Requires Python 3.8+, no external dependencies.
 Tokens are read directly from ~/.claude/.credentials.json (Claude Code's store).
 """
@@ -77,6 +83,29 @@ def save_maki_tokens(tokens):
     os.replace(tmp, TOKEN_FILE)
 
 
+def save_claude_code_tokens(tokens):
+    """Mirror a freshly-refreshed token back into Claude Code's own
+    credentials file, preserving unrelated fields (subscriptionType, etc).
+    Keeps both stores in sync so neither ends up holding a stale,
+    already-rotated refresh token that the OAuth server will reject.
+    """
+    try:
+        with open(CREDENTIALS_FILE) as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return
+    oauth = data.setdefault("claudeAiOauth", {})
+    oauth["accessToken"] = tokens["access"]
+    if tokens.get("refresh"):
+        oauth["refreshToken"] = tokens["refresh"]
+    oauth["expiresAt"] = tokens["expires"]
+    tmp = CREDENTIALS_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, CREDENTIALS_FILE)
+
+
 def now_ms():
     return int(time.time() * 1000)
 
@@ -115,6 +144,10 @@ def do_refresh(tokens):
         "client_id": client_id,
     }
     save_maki_tokens(new_tokens)
+    try:
+        save_claude_code_tokens(new_tokens)
+    except OSError:
+        pass  # best-effort; maki's own store is still authoritative for us
     return new_tokens
 
 
@@ -123,7 +156,11 @@ OAUTH_CONTRACT_HEADERS = {
     "anthropic-beta": "oauth-2025-04-20,claude-code-20250219",
 }
 
-MESSAGES_URL = "https://api.anthropic.com/v1/messages?beta=true"
+# Override to route through a gateway/proxy (e.g. Aperture by Tailscale)
+# instead of hitting Anthropic directly. Point it at your gateway's host;
+# the /v1/messages path and beta query param are appended automatically.
+CLAUDE_OAUTH_BASE_URL = os.environ.get("CLAUDE_OAUTH_BASE_URL", "https://api.anthropic.com")
+MESSAGES_URL = f"{CLAUDE_OAUTH_BASE_URL.rstrip('/')}/v1/messages?beta=true"
 
 
 def build_resolved(tokens):
@@ -152,11 +189,30 @@ def resolve_tokens():
     if maki_tokens and not is_expired(maki_tokens):
         return maki_tokens, "maki_store"
 
-    # Need a refresh — use whichever store has a refresh token
-    refresh_source = tokens if (tokens and tokens.get("refresh")) else maki_tokens
-    if refresh_source and refresh_source.get("refresh"):
-        return do_refresh(refresh_source), "refreshed"
+    # Need a refresh — try whichever store has the more recently issued
+    # refresh token first (higher "expires" implies a later refresh),
+    # then fall back to the other store in case that token is stale
+    # (e.g. already rotated/consumed by the other side).
+    candidates = [t for t in (tokens, maki_tokens) if t and t.get("refresh")]
+    candidates.sort(key=lambda t: t.get("expires", 0), reverse=True)
+    # De-dupe identical refresh tokens so we don't retry the same one twice.
+    seen = set()
+    unique_candidates = []
+    for c in candidates:
+        if c["refresh"] not in seen:
+            seen.add(c["refresh"])
+            unique_candidates.append(c)
 
+    last_err = None
+    for source in unique_candidates:
+        try:
+            return do_refresh(source), "refreshed"
+        except urllib.error.HTTPError as e:
+            last_err = e
+            continue
+
+    if last_err:
+        raise last_err
     return None, "no_tokens"
 
 
