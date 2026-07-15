@@ -23,8 +23,11 @@ Requires Python 3.8+, no external dependencies.
 Tokens are read directly from ~/.claude/.credentials.json (Claude Code's store).
 """
 
+import getpass
 import json
 import os
+import platform
+import subprocess
 import sys
 import time
 import urllib.request
@@ -33,6 +36,59 @@ import urllib.error
 
 CREDENTIALS_FILE = os.path.expanduser("~/.claude/.credentials.json")
 TOKEN_FILE = os.path.expanduser("~/.maki/auth/claude.json")
+
+# On macOS, Claude Code stores its OAuth credentials in the login Keychain
+# (a generic-password item) rather than in CREDENTIALS_FILE — that file only
+# exists on Linux / headless installs. Mirror both stores so this provider
+# works regardless of where the CLI actually keeps its tokens.
+KEYCHAIN_SERVICE = "Claude Code-credentials"
+IS_MACOS = platform.system() == "Darwin"
+
+
+def _keychain_read():
+    """Return the parsed credentials dict from the macOS login Keychain, or None."""
+    try:
+        out = subprocess.run(
+            ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0 or not out.stdout.strip():
+        return None
+    try:
+        return json.loads(out.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def _keychain_write(data):
+    """Update the Claude Code credentials item in the macOS login Keychain."""
+    account = getpass.getuser()
+    subprocess.run(
+        ["security", "add-generic-password", "-U",
+         "-s", KEYCHAIN_SERVICE, "-a", account, "-w", json.dumps(data)],
+        capture_output=True, text=True, timeout=10, check=True,
+    )
+
+
+def _read_claude_code_credentials():
+    """Read Claude Code's raw credentials dict from whichever store it uses.
+
+    Returns (data, store) where store is "file" or "keychain", or (None, None).
+    Prefers the file (present on Linux / headless); on macOS falls back to the
+    login Keychain, which is where the CLI actually stores tokens there.
+    """
+    try:
+        with open(CREDENTIALS_FILE) as f:
+            return json.load(f), "file"
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    if IS_MACOS:
+        data = _keychain_read()
+        if data is not None:
+            return data, "keychain"
+    return None, None
 
 # Claude Code OAuth endpoints (extracted from claude CLI binary)
 TOKEN_ENDPOINT = "https://platform.claude.com/v1/oauth/token"
@@ -47,22 +103,20 @@ DEFAULT_SCOPES = ["user:inference"]
 
 
 def load_claude_code_tokens():
-    """Read tokens directly from Claude Code's credentials file."""
-    try:
-        with open(CREDENTIALS_FILE) as f:
-            data = json.load(f)
-        oauth = data.get("claudeAiOauth", {})
-        if not oauth.get("accessToken"):
-            return None
-        return {
-            "access": oauth["accessToken"],
-            "refresh": oauth.get("refreshToken"),
-            "expires": oauth.get("expiresAt", 0),  # milliseconds
-            "scopes": oauth.get("scopes", DEFAULT_SCOPES),
-            "client_id": oauth.get("clientId", CLAUDE_CODE_CLIENT_ID),
-        }
-    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+    """Read tokens directly from Claude Code's credentials store (file or Keychain)."""
+    data, _ = _read_claude_code_credentials()
+    if not data:
         return None
+    oauth = data.get("claudeAiOauth", {})
+    if not oauth.get("accessToken"):
+        return None
+    return {
+        "access": oauth["accessToken"],
+        "refresh": oauth.get("refreshToken"),
+        "expires": oauth.get("expiresAt", 0),  # milliseconds
+        "scopes": oauth.get("scopes", DEFAULT_SCOPES),
+        "client_id": oauth.get("clientId", CLAUDE_CODE_CLIENT_ID),
+    }
 
 
 def load_maki_tokens():
@@ -89,16 +143,17 @@ def save_claude_code_tokens(tokens):
     Keeps both stores in sync so neither ends up holding a stale,
     already-rotated refresh token that the OAuth server will reject.
     """
-    try:
-        with open(CREDENTIALS_FILE) as f:
-            data = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+    data, store = _read_claude_code_credentials()
+    if not data:
         return
     oauth = data.setdefault("claudeAiOauth", {})
     oauth["accessToken"] = tokens["access"]
     if tokens.get("refresh"):
         oauth["refreshToken"] = tokens["refresh"]
     oauth["expiresAt"] = tokens["expires"]
+    if store == "keychain":
+        _keychain_write(data)
+        return
     tmp = CREDENTIALS_FILE + ".tmp"
     with open(tmp, "w") as f:
         json.dump(data, f, indent=2)
