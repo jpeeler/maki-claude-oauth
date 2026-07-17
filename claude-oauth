@@ -36,7 +36,11 @@ import urllib.parse
 import urllib.error
 
 CREDENTIALS_FILE = os.path.expanduser("~/.claude/.credentials.json")
-TOKEN_FILE = os.path.expanduser("~/.maki/auth/claude.json")
+# This is the provider's OWN private refresh cache, not maki's credential store
+# (maki calls `resolve` at request time and never reads this file). Keep it out
+# of ~/.maki/ — that legacy tree triggers maki's data-dir migration, and
+# re-creating it wedges startup with "resolve data directory: File exists".
+TOKEN_FILE = os.path.expanduser("~/.config/maki/claude-oauth-token.json")
 
 # On macOS, Claude Code stores its OAuth credentials in the login Keychain
 # (a generic-password item) rather than in CREDENTIALS_FILE — that file only
