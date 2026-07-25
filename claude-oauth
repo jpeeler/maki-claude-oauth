@@ -325,6 +325,14 @@ def cmd_info():
 # listed per tier is used for sub-agents.
 MODELS = [
     {
+        "id": "claude-opus-5",
+        "tier": "strong",
+        "context_window": 200000,
+        "max_output_tokens": 32000,
+        "pricing": {"input": 5.0, "output": 25.0,
+                    "cache_write": 6.25, "cache_read": 0.5},
+    },
+    {
         "id": "claude-opus-4-8",
         "tier": "strong",
         "context_window": 200000,
