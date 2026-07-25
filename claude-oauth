@@ -27,6 +27,7 @@ import getpass
 import json
 import os
 import platform
+import re
 import ssl
 import subprocess
 import sys
@@ -41,6 +42,11 @@ CREDENTIALS_FILE = os.path.expanduser("~/.claude/.credentials.json")
 # of ~/.maki/ — that legacy tree triggers maki's data-dir migration, and
 # re-creating it wedges startup with "resolve data directory: File exists".
 TOKEN_FILE = os.path.expanduser("~/.config/maki/claude-oauth-token.json")
+
+# Stamp file for the periodic "are the hardcoded MODELS still current?" check.
+# We only hit Anthropic's Models API at most once per MODEL_CHECK_INTERVAL_S.
+MODEL_CHECK_STAMP = os.path.expanduser("~/.config/maki/claude-oauth-modelcheck.json")
+MODEL_CHECK_INTERVAL_S = 7 * 24 * 3600  # weekly
 
 # On macOS, Claude Code stores its OAuth credentials in the login Keychain
 # (a generic-password item) rather than in CREDENTIALS_FILE — that file only
@@ -375,8 +381,89 @@ MODELS = [
 ]
 
 
+def _fetch_live_model_ids():
+    """Return the set of model IDs Anthropic currently serves, or None on failure."""
+    tokens, _ = resolve_tokens()
+    if not tokens:
+        return None
+    url = f"{CLAUDE_OAUTH_BASE_URL.rstrip('/')}/v1/models?limit=1000"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {tokens['access']}",
+            "anthropic-version": "2023-06-01",
+            **OAUTH_CONTRACT_HEADERS,
+        },
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=10, context=_ssl_context()) as resp:
+        data = json.loads(resp.read())
+    return {m["id"] for m in data.get("data", []) if m.get("id")}
+
+
+def check_models_freshness(force=False):
+    """
+    Occasionally compare the hardcoded MODELS catalog against Anthropic's live
+    Models API and warn (to stderr) if it has drifted. Rate-limited via a stamp
+    file so `models` stays fast. Best-effort: any failure is swallowed so this
+    never breaks model listing.
+
+    Returns True if a live check actually ran, False if skipped/failed.
+    """
+    now = time.time()
+    if not force:
+        try:
+            age = now - os.path.getmtime(MODEL_CHECK_STAMP)
+            if age < MODEL_CHECK_INTERVAL_S:
+                return False
+        except OSError:
+            pass  # no stamp yet → proceed with a check
+
+    try:
+        live = _fetch_live_model_ids()
+    except Exception:
+        live = None
+    if live is None:
+        # Couldn't reach the API (offline / not authed). Don't update the stamp
+        # so we retry next time rather than going quiet for a full week.
+        return False
+
+    # Anthropic serves both dateless aliases (claude-haiku-4-5) and pinned
+    # dated snapshots (claude-haiku-4-5-20251001). Our catalog uses aliases, so
+    # collapse the "-YYYYMMDD" suffix before diffing to avoid false positives.
+    def _base(mid):
+        return re.sub(r"-\d{8}$", "", mid)
+
+    live_bases = {_base(i) for i in live}
+    known_bases = {_base(m["id"]) for m in MODELS}
+    new_ids = sorted(live_bases - known_bases)
+    gone_ids = sorted(known_bases - live_bases)
+
+    if new_ids or gone_ids:
+        print("claude-oauth: model catalog looks out of date.", file=sys.stderr)
+        if new_ids:
+            print(f"  new models available (add to MODELS): {', '.join(new_ids)}",
+                  file=sys.stderr)
+        if gone_ids:
+            print(f"  models no longer served (consider removing): {', '.join(gone_ids)}",
+                  file=sys.stderr)
+        print("  edit the MODELS list in this provider to update.", file=sys.stderr)
+
+    # Record that we checked (even when in sync) so we back off for a week.
+    try:
+        os.makedirs(os.path.dirname(MODEL_CHECK_STAMP), exist_ok=True)
+        with open(MODEL_CHECK_STAMP, "w") as f:
+            json.dump({"checked_at": now, "live_ids": sorted(live)}, f)
+    except OSError:
+        pass
+    return True
+
+
 def cmd_models():
     print(json.dumps(MODELS))
+    # Fire the occasional freshness check *after* emitting the catalog so maki
+    # always gets valid JSON on stdout regardless of what the check does.
+    check_models_freshness(force="--check" in sys.argv[2:])
 
 
 def cmd_resolve():
@@ -447,7 +534,7 @@ def cmd_logout():
 
 def main():
     if len(sys.argv) < 2:
-        print(f"usage: {sys.argv[0]} <info|models|resolve|refresh|login|logout>", file=sys.stderr)
+        print(f"usage: {sys.argv[0]} <info|models [--check]|resolve|refresh|login|logout>", file=sys.stderr)
         sys.exit(1)
 
     commands = {
