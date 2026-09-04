@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""Print current Claude monthly spend as a single JSON line.
+
+Reads OAuth credentials via the claude-oauth provider (which handles token
+refresh), queries Anthropic's usage endpoint, and emits:
+
+    {"used": 570.53, "limit": 5000.0, "pct": 11, "severity": "normal"}
+
+Results are cached in claude-spend-state.json next to this script. The
+endpoint is contacted at most once per MIN_INTERVAL seconds no matter how
+often this runs; in between, the cached report is re-emitted with
+"stale": true. HTTP 429 (and any other failure) triggers exponential
+backoff between MIN_INTERVAL and BACKOFF_MAX, honouring Retry-After when
+the server sends it.
+
+On any failure it emits the last known report with "stale": true and an
+"error" field, or {"error": "<reason>"} if nothing has been cached yet,
+and exits 0 so a polling loop keeps running.
+"""
+
+import json
+import os
+import subprocess
+import sys
+import time
+from typing import NoReturn
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROVIDER = os.path.join(ROOT, "providers", "claude-oauth")
+STATE_FILE = os.path.join(ROOT, "claude-spend-state.json")
+URL = "https://api.anthropic.com/api/oauth/usage"
+TIMEOUT = 20
+MIN_INTERVAL = 120
+BACKOFF_MAX = 3600
+
+
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def save_state(state):
+    tmp = STATE_FILE + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp, STATE_FILE)
+    except OSError:
+        pass
+
+
+def emit(obj) -> NoReturn:
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+    sys.exit(0)
+
+
+def emit_cached(state, reason) -> NoReturn:
+    last = state.get("last")
+    if isinstance(last, dict) and last.get("used") is not None:
+        report = dict(last)
+        report["stale"] = True
+        report["error"] = reason
+        last_at = state.get("last_at")
+        if last_at:
+            report["age"] = max(0, int(time.time() - last_at))
+        emit(report)
+    emit({"error": reason})
+
+
+def fail(state, reason, retry_after=None) -> NoReturn:
+    backoff = state.get("backoff") or 0
+    backoff = min(max(backoff * 2, MIN_INTERVAL), BACKOFF_MAX)
+    if retry_after:
+        backoff = min(max(backoff, retry_after), BACKOFF_MAX)
+    state["backoff"] = backoff
+    state["next_at"] = time.time() + backoff
+    state["last_error"] = reason
+    save_state(state)
+    emit_cached(state, reason)
+
+
+def retry_after_secs(headers):
+    for line in headers.splitlines():
+        name, _, value = line.partition(":")
+        if name.strip().lower() == "retry-after":
+            try:
+                return int(float(value.strip()))
+            except ValueError:
+                return None
+    return None
+
+
+def money(part):
+    if not part or part.get("amount_minor") is None:
+        return None
+    return part["amount_minor"] / (10 ** part.get("exponent", 2))
+
+
+def main():
+    state = load_state()
+    if time.time() < (state.get("next_at") or 0):
+        emit_cached(state, state.get("last_error") or "throttled")
+
+    try:
+        resolved = subprocess.run(
+            [PROVIDER, "resolve"], capture_output=True, text=True, timeout=TIMEOUT
+        )
+    except (OSError, subprocess.SubprocessError):
+        fail(state, "provider")
+    if resolved.returncode != 0:
+        fail(state, "auth")
+
+    try:
+        headers = json.loads(resolved.stdout)["headers"]
+    except (ValueError, KeyError):
+        fail(state, "provider")
+
+    config = ['url = "%s"' % URL]
+    for key, value in headers.items():
+        config.append('header = "%s: %s"' % (key, value))
+
+    try:
+        resp = subprocess.run(
+            [
+                "curl",
+                "-sS",
+                "--max-time",
+                str(TIMEOUT),
+                "-D",
+                "/dev/stderr",
+                "-w",
+                "\n%{http_code}",
+                "-K",
+                "-",
+            ],
+            input="\n".join(config),
+            capture_output=True,
+            text=True,
+            timeout=TIMEOUT + 5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        fail(state, "net")
+    if resp.returncode != 0:
+        fail(state, "net")
+
+    body, _, code = resp.stdout.rpartition("\n")
+    code = code.strip()
+
+    if code == "429":
+        fail(state, "ratelimit", retry_after_secs(resp.stderr))
+    if code in ("401", "403"):
+        fail(state, "auth")
+    if code != "200":
+        fail(state, "http")
+
+    try:
+        spend = json.loads(body).get("spend") or {}
+    except ValueError:
+        fail(state, "parse")
+
+    used = money(spend.get("used"))
+    if used is None:
+        fail(state, "nodata")
+
+    report = {
+        "used": used,
+        "limit": money(spend.get("limit")),
+        "pct": spend.get("percent"),
+        "severity": spend.get("severity") or "normal",
+        "age": 0,
+    }
+    state["last"] = report
+    state["last_at"] = time.time()
+    state["backoff"] = 0
+    state["next_at"] = time.time() + MIN_INTERVAL
+    state.pop("last_error", None)
+    save_state(state)
+    emit(report)
+
+
+if __name__ == "__main__":
+    main()
