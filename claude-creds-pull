@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+#
+# claude-creds-pull — pull Claude OAuth credentials from an authority machine.
+#
+# Bumble Confidential. For Internal Use Only.
+#
+# WHY PULL AND NOT SYNC
+#
+# Anthropic rotates the refresh token on every refresh: the token endpoint
+# returns a NEW refresh_token and the old one stops working. If two machines
+# both refresh the same credential they invalidate each other, producing
+# random "please log in again" prompts on whichever refreshed second.
+#
+# So exactly one machine (the "authority") is allowed to refresh. Every other
+# machine pulls a read-only copy and never refreshes on its own. When the copy
+# expires you pull again. That is the whole design.
+#
+# USAGE
+#   claude-creds-pull [--from HOST] [--check] [--force] [--quiet]
+#
+#   --from HOST   ssh destination of the authority machine
+#                 (default: $CLAUDE_CREDS_AUTHORITY)
+#   --check       report local credential state and exit; changes nothing
+#   --force       overwrite even when the local copy is newer than the remote
+#   --quiet       only print on error
+#
+# EXIT CODES
+#   0 ok / already fresh   2 usage error   3 remote unreachable
+#   4 remote keychain locked or empty      5 malformed payload
+#   6 local write failed   7 refused (local newer; use --force)
+set -euo pipefail
+
+SERVICE="Claude Code-credentials"
+JCODE_AUTH="$HOME/.jcode/auth.json"
+LOCK="$HOME/.cache/claude-creds-pull.lock.d"
+AUTHORITY="${CLAUDE_CREDS_AUTHORITY:-}"
+MODE=pull
+FORCE=0
+QUIET=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --from) AUTHORITY="${2:-}"; shift 2 ;;
+    --check) MODE=check; shift ;;
+    --force) FORCE=1; shift ;;
+    --quiet) QUIET=1; shift ;;
+    -h|--help) sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+
+log()  { [[ $QUIET -eq 1 ]] || printf '%s\n' "$*"; }
+err()  { printf 'error: %s\n' "$*" >&2; }
+
+# Never let a token reach stdout, a log, or the process table. Payloads move
+# through stdin/heredoc-free pipes and temp files with a private umask only.
+umask 077
+
+# Milliseconds-since-epoch expiry out of a credentials blob on stdin. Prints
+# nothing but integers; never echoes token material.
+expiry_of() {
+  python3 -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(1)
+o=d.get("claudeAiOauth",d)
+v=o.get("expiresAt")
+print(int(v) if isinstance(v,(int,float)) else 0)
+' 2>/dev/null || echo 0
+}
+
+validate() {
+  python3 -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception as e:
+    print("not valid JSON",file=sys.stderr); sys.exit(1)
+o=d.get("claudeAiOauth",d)
+missing=[k for k in ("accessToken","refreshToken") if not o.get(k)]
+if missing:
+    print("missing fields: "+",".join(missing),file=sys.stderr); sys.exit(1)
+for k in ("accessToken","refreshToken"):
+    if not str(o[k]).startswith("sk-ant-"):
+        print(f"{k} does not look like an Anthropic token",file=sys.stderr); sys.exit(1)
+' 2>&1
+}
+
+human_expiry() {
+  python3 -c '
+import sys,datetime
+ms=int(sys.argv[1])
+if ms<=0: print("unknown"); raise SystemExit
+dt=datetime.datetime.fromtimestamp(ms/1000)
+delta=dt-datetime.datetime.now()
+secs=int(delta.total_seconds())
+if secs<0: print(f"EXPIRED at {dt:%Y-%m-%d %H:%M}")
+elif secs<3600: print(f"{secs//60}m left (at {dt:%H:%M})")
+elif secs<86400: print(f"{secs//3600}h {secs%3600//60}m left (at {dt:%m-%d %H:%M})")
+else: print(f"{secs//86400}d left (at {dt:%Y-%m-%d %H:%M})")
+' "$1"
+}
+
+read_local() { security find-generic-password -s "$SERVICE" -w 2>/dev/null || true; }
+
+if [[ $MODE == check ]]; then
+  blob="$(read_local)"
+  if [[ -z $blob ]]; then log "local: no '$SERVICE' keychain item"; exit 0; fi
+  if msg="$(printf '%s' "$blob" | validate)"; [[ -n $msg ]]; then
+    err "local credential is unusable: $msg"; exit 5
+  fi
+  exp="$(printf '%s' "$blob" | expiry_of)"
+  log "local:  access token $(human_expiry "$exp")"
+  [[ -f $JCODE_AUTH ]] && log "jcode:  $JCODE_AUTH present"
+  exit 0
+fi
+
+[[ -n $AUTHORITY ]] || {
+  err "no authority host. Pass --from HOST or set CLAUDE_CREDS_AUTHORITY."
+  exit 2
+}
+
+# macOS ships no flock(1), so use an atomic mkdir as the mutex.
+mkdir -p "$(dirname "$LOCK")"
+if ! mkdir "$LOCK" 2>/dev/null; then
+  # Reap a lock left behind by a crashed run.
+  if [[ -f "$LOCK/pid" ]] && ! kill -0 "$(cat "$LOCK/pid" 2>/dev/null)" 2>/dev/null; then
+    rm -rf "$LOCK"
+    mkdir "$LOCK" 2>/dev/null || { err "another pull is in progress"; exit 6; }
+  else
+    err "another pull is in progress"; exit 6
+  fi
+fi
+echo $$ >"$LOCK/pid"
+cleanup_lock() { rm -rf "$LOCK"; }
+
+tmp="$(mktemp "${TMPDIR:-/tmp}/ccp.XXXXXX")"
+trap 'rm -f "$tmp"; cleanup_lock' EXIT
+
+log "pulling from $AUTHORITY ..."
+# An SSH session has no GUI security session (SECURITYSESSIONID is unset), so
+# even an already-unlocked login keychain refuses reads with
+# errSecInteractionNotAllowed (exit 36). Issuing an explicit unlock inside the
+# same remote shell attaches this session to the keychain and makes the read
+# succeed. The empty passphrase works when the keychain password matches the
+# login password and the keychain is already unlocked; otherwise the remote
+# prompts, which BatchMode turns into a clean failure rather than a hang.
+#
+# stderr is captured (not discarded) so a real error can be reported instead of
+# a bare exit code. Nothing from stdout is ever logged: it is the credential.
+printf -v remote_cmd '%s\n%s' \
+  'security unlock-keychain -p "" ~/Library/Keychains/login.keychain-db >/dev/null 2>&1' \
+  "security find-generic-password -s '${SERVICE}' -w"
+
+ssh_err="$(mktemp "${TMPDIR:-/tmp}/ccp-err.XXXXXX")"
+trap 'rm -f "$tmp" "$ssh_err"; cleanup_lock' EXIT
+
+# BatchMode so a passphrase prompt fails fast instead of hanging a cron job.
+if ! ssh -o BatchMode=yes -o ConnectTimeout=10 "$AUTHORITY" \
+      "$remote_cmd" >"$tmp" 2>"$ssh_err"; then
+  rc=$?
+  err "could not read the keychain on $AUTHORITY (ssh/security exit $rc)."
+  if [[ $rc -eq 36 ]]; then
+    err "Exit 36 is errSecInteractionNotAllowed: the keychain refused a"
+    err "non-GUI session. On the authority, from a Terminal window, run:"
+    err "    security unlock-keychain"
+    err "and confirm the item allows access without a prompt."
+  elif [[ $rc -eq 255 ]]; then
+    err "SSH itself failed. Check reachability and key auth:"
+    err "    ssh -v $AUTHORITY true"
+  else
+    err "Possible causes: keychain locked, host unreachable, or Claude Code"
+    err "is not set up on that machine."
+  fi
+  [[ -s $ssh_err ]] && err "remote said: $(head -3 "$ssh_err" | tr '\n' ' ')"
+  exit 3
+fi
+
+[[ -s $tmp ]] || { err "$AUTHORITY returned an empty credential"; exit 4; }
+
+if msg="$(validate <"$tmp")"; [[ -n $msg ]]; then
+  err "payload from $AUTHORITY is malformed: $msg"
+  exit 5
+fi
+
+remote_exp="$(expiry_of <"$tmp")"
+local_blob="$(read_local)"
+local_exp=0
+[[ -n $local_blob ]] && local_exp="$(printf '%s' "$local_blob" | expiry_of)"
+
+if [[ $FORCE -eq 0 && $local_exp -gt $remote_exp ]]; then
+  err "local copy is NEWER than $AUTHORITY (local $(human_expiry "$local_exp"), remote $(human_expiry "$remote_exp"))."
+  err "That usually means this machine refreshed too, which breaks the"
+  err "single-writer rule. Re-run with --force to overwrite anyway."
+  exit 7
+fi
+
+# jcode keeps its own plain-JSON copy and prefers it over the keychain, so a
+# stale one would silently win. Refresh it when it already exists.
+sync_jcode_auth() {
+  [[ -f $JCODE_AUTH ]] || return 0
+  if python3 - "$JCODE_AUTH" "$tmp" <<'PY'
+import json,sys,os,tempfile
+auth_path,blob_path=sys.argv[1],sys.argv[2]
+o=json.load(open(blob_path)); o=o.get("claudeAiOauth",o)
+try: auth=json.load(open(auth_path))
+except Exception: sys.exit(1)
+accounts=auth.get("anthropic_accounts")
+if not isinstance(accounts,list) or not accounts: sys.exit(1)
+active=auth.get("active_anthropic_account")
+tgt=next((a for a in accounts if a.get("label")==active), accounts[0])
+tgt["access"]=o["accessToken"]; tgt["refresh"]=o["refreshToken"]
+if isinstance(o.get("expiresAt"),(int,float)): tgt["expires"]=int(o["expiresAt"])
+if o.get("scopes"): tgt["scopes"]=o["scopes"]
+d=os.path.dirname(auth_path)
+fd,tmp=tempfile.mkstemp(dir=d); os.fchmod(fd,0o600)
+with os.fdopen(fd,"w") as f: json.dump(auth,f,indent=1)
+os.replace(tmp,auth_path)
+PY
+  then log "updated $JCODE_AUTH"
+  else log "note: left $JCODE_AUTH alone (unrecognised shape)"; fi
+}
+
+if [[ "$local_blob" == "$(cat "$tmp")" ]]; then
+  # The keychain already matches, but jcode's auth.json is a separate store
+  # that can drift on its own. Reconcile it before declaring success, or a
+  # stale token there silently wins over the correct keychain value.
+  log "keychain already up to date ($(human_expiry "$remote_exp"))"
+  sync_jcode_auth
+  exit 0
+fi
+
+# -U updates in place when the item exists, so no delete/recreate window.
+if ! security add-generic-password -U \
+      -s "$SERVICE" -a "${USER}" -w "$(cat "$tmp")" 2>/dev/null; then
+  err "failed to write the keychain item"
+  exit 6
+fi
+
+sync_jcode_auth
+
+log "pulled ok — $(human_expiry "$remote_exp")"
