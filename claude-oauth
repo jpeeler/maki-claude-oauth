@@ -250,7 +250,7 @@ def do_refresh(tokens):
 
 
 OAUTH_CONTRACT_HEADERS = {
-    "User-Agent": "claude-cli/1.0.0",
+    "User-Agent": "claude-cli/2.1.251",
     "anthropic-beta": "oauth-2025-04-20,claude-code-20250219",
 }
 
