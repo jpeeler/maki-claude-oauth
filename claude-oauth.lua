@@ -57,7 +57,7 @@ end
 
 local function contract_headers()
   return {
-    ["User-Agent"] = "claude-cli/2.1.251",
+    ["User-Agent"] = "claude-cli/2.1.280 (external, sdk-cli)",
     ["anthropic-beta"] = "oauth-2025-04-20,claude-code-20250219",
   }
 end
