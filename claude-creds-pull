@@ -147,29 +147,45 @@ log "pulling from $AUTHORITY ..."
 #
 # stderr is captured (not discarded) so a real error can be reported instead of
 # a bare exit code. Nothing from stdout is ever logged: it is the credential.
-printf -v remote_cmd '%s\n%s' \
-  'security unlock-keychain -p "" ~/Library/Keychains/login.keychain-db >/dev/null 2>&1' \
-  "security find-generic-password -s '${SERVICE}' -w"
+IFS= read -r -d '' remote_cmd <<REMOTE || true
+security unlock-keychain -p "" ~/Library/Keychains/login.keychain-db >/dev/null 2>&1
+KC="\$(security find-generic-password -s '${SERVICE}' -w 2>/dev/null)" \\
+python3 - "\${XDG_STATE_HOME:-\$HOME/.local/state}/maki/auth/plugins/claude-oauth.json" <<'PY'
+import json,os,sys
+try: blob=json.loads(os.environ.get("KC") or "")
+except Exception: blob=None
+if not isinstance(blob,dict): blob={}
+try: m=json.load(open(sys.argv[1]))
+except Exception: m={}
+o=dict(blob.get("claudeAiOauth") or {})
+if m.get("access") and m.get("refresh") and int(m.get("expires") or 0)>int(o.get("expiresAt") or 0):
+    o.update(accessToken=m["access"],refreshToken=m["refresh"],expiresAt=int(m["expires"]))
+    if m.get("scopes"): o["scopes"]=m["scopes"]
+if not o.get("accessToken"): sys.exit(4)
+blob["claudeAiOauth"]=o
+sys.stdout.write(json.dumps(blob,separators=(",",":")))
+PY
+REMOTE
 
 ssh_err="$(mktemp "${TMPDIR:-/tmp}/ccp-err.XXXXXX")"
 trap 'rm -f "$tmp" "$ssh_err"; cleanup_lock' EXIT
 
 # BatchMode so a passphrase prompt fails fast instead of hanging a cron job.
-if ! ssh -o BatchMode=yes -o ConnectTimeout=10 "$AUTHORITY" \
-      "$remote_cmd" >"$tmp" 2>"$ssh_err"; then
-  rc=$?
-  err "could not read the keychain on $AUTHORITY (ssh/security exit $rc)."
-  if [[ $rc -eq 36 ]]; then
-    err "Exit 36 is errSecInteractionNotAllowed: the keychain refused a"
-    err "non-GUI session. On the authority, from a Terminal window, run:"
-    err "    security unlock-keychain"
-    err "and confirm the item allows access without a prompt."
+rc=0
+ssh -o BatchMode=yes -o ConnectTimeout=10 "$AUTHORITY" \
+  "$remote_cmd" >"$tmp" 2>"$ssh_err" || rc=$?
+if [[ $rc -ne 0 ]]; then
+  err "could not read credentials on $AUTHORITY (exit $rc)."
+  if [[ $rc -eq 4 ]]; then
+    err "Neither maki's store nor the '$SERVICE' keychain item had a token."
+    err "On the authority, log in with maki or claude, or from a Terminal"
+    err "window run:  security unlock-keychain"
   elif [[ $rc -eq 255 ]]; then
     err "SSH itself failed. Check reachability and key auth:"
     err "    ssh -v $AUTHORITY true"
   else
-    err "Possible causes: keychain locked, host unreachable, or Claude Code"
-    err "is not set up on that machine."
+    err "Possible causes: python3 missing on the authority, or the host is"
+    err "unreachable."
   fi
   [[ -s $ssh_err ]] && err "remote said: $(head -3 "$ssh_err" | tr '\n' ' ')"
   exit 3
