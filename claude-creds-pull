@@ -2,8 +2,6 @@
 #
 # claude-creds-pull — pull Claude OAuth credentials from an authority machine.
 #
-# Bumble Confidential. For Internal Use Only.
-#
 # WHY PULL AND NOT SYNC
 #
 # Anthropic rotates the refresh token on every refresh: the token endpoint
@@ -29,6 +27,16 @@
 #   4 remote keychain locked or empty      5 malformed payload
 #   6 local write failed   7 refused (local newer; use --force)
 set -euo pipefail
+
+# macOS keeps OAuth creds in the login keychain via security(1); Linux keeps
+# them in a plain JSON file. Everything below branches on which store exists.
+if command -v security >/dev/null 2>&1; then
+  PLATFORM=mac
+  CRED_FILE=""
+else
+  PLATFORM=linux
+  CRED_FILE="$HOME/.claude/.credentials.json"
+fi
 
 SERVICE="Claude Code-credentials"
 JCODE_AUTH="$HOME/.jcode/auth.json"
@@ -100,11 +108,21 @@ else: print(f"{secs//86400}d left (at {dt:%Y-%m-%d %H:%M})")
 ' "$1"
 }
 
-read_local() { security find-generic-password -s "$SERVICE" -w 2>/dev/null || true; }
+read_local() {
+  if [[ $PLATFORM == mac ]]; then
+    security find-generic-password -s "$SERVICE" -w 2>/dev/null || true
+  else
+    [[ -f $CRED_FILE ]] && cat "$CRED_FILE" || true
+  fi
+}
 
 if [[ $MODE == check ]]; then
   blob="$(read_local)"
-  if [[ -z $blob ]]; then log "local: no '$SERVICE' keychain item"; exit 0; fi
+  if [[ -z $blob ]]; then
+    if [[ $PLATFORM == mac ]]; then log "local: no '$SERVICE' keychain item"
+    else log "local: no $CRED_FILE"; fi
+    exit 0
+  fi
   if msg="$(printf '%s' "$blob" | validate)"; [[ -n $msg ]]; then
     err "local credential is unusable: $msg"; exit 5
   fi
@@ -245,10 +263,22 @@ if [[ "$local_blob" == "$(cat "$tmp")" ]]; then
   exit 0
 fi
 
-# -U updates in place when the item exists, so no delete/recreate window.
-if ! security add-generic-password -U \
-      -s "$SERVICE" -a "${USER}" -w "$(cat "$tmp")" 2>/dev/null; then
-  err "failed to write the keychain item"
+write_local() {
+  if [[ $PLATFORM == mac ]]; then
+    # -U updates in place when the item exists, so no delete/recreate window.
+    security add-generic-password -U \
+      -s "$SERVICE" -a "${USER}" -w "$(cat "$tmp")" 2>/dev/null
+  else
+    # Same dir so mv is an atomic rename; umask 077 leaves it mode 600.
+    mkdir -p "${CRED_FILE%/*}" || return 1
+    cat "$tmp" >"$CRED_FILE.new" || return 1
+    mv "${CRED_FILE}.new" "$CRED_FILE" || return 1
+  fi
+}
+
+if ! write_local; then
+  if [[ $PLATFORM == mac ]]; then err "failed to write the keychain item"
+  else err "failed to write $CRED_FILE"; fi
   exit 6
 fi
 
