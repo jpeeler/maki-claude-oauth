@@ -56,11 +56,31 @@ maki.api.create_autocmd({ "SessionReset", "SessionFocusChanged" }, {
   callback = nono_status_hint,
 })
 
--- Bumble Confidential. For Internal Use Only.
 local spend = require("claude-spend")
-local SPEND_STATE = spend.STATE_FILE
+local go_spend = require("go-spend")
 local SPEND_POLL_SECS = 30
 local WARN_STYLE = maki.ui.theme_color("warning") and "warning" or "error"
+
+local SOURCES = {
+  claude = { state_file = spend.STATE_FILE, fetch = spend.fetch },
+  go = { state_file = go_spend.STATE_FILE, fetch = go_spend.fetch },
+}
+local WINDOW_LABELS = { rolling = "5h", weekly = "wk", monthly = "mo" }
+
+local function spend_source()
+  local ok, model = pcall(maki.model.get)
+  if not ok or type(model) ~= "table" then
+    return nil
+  end
+  local provider = string.lower(model.provider or "")
+  local spec = string.lower(model.spec or "")
+  if provider == "anthropic" or spec:find("claude", 1, true) then
+    return "claude"
+  elseif provider:find("opencode", 1, true) or spec:find("opencode", 1, true) then
+    return "go"
+  end
+  return nil
+end
 
 local function spend_style(report)
   if report.stale then
@@ -86,8 +106,8 @@ local function spend_age(secs)
   return string.format("%dd", math.floor(secs / 86400))
 end
 
-local function read_spend_state()
-  local raw = maki.fs.read(SPEND_STATE)
+local function read_spend_state(path)
+  local raw = maki.fs.read(path)
   if not raw then
     return nil
   end
@@ -98,37 +118,60 @@ local function read_spend_state()
   return state
 end
 
-local function render_spend(report)
-  if not report.used then
-    spend_span = { string.format("[spend: %s]", report.error or "?"), "dim" }
+local function spend_has_data(kind, last)
+  if type(last) ~= "table" then
+    return false
+  elseif kind == "claude" then
+    return last.used ~= nil
+  end
+  return last.pct ~= nil
+end
+
+local function render_spend(kind, report)
+  if not spend_has_data(kind, report) then
+    spend_span = { string.format("[spend: %s]", report and report.error or "?"), "dim" }
     render_status_hint()
     return
   end
 
-  local text = string.format("$%.2f", report.used)
-  if report.pct then
-    text = string.format("%s (%d%%)", text, report.pct)
+  local text
+  if kind == "go" then
+    text = string.format("%s %d%%/%s", kind, report.pct, WINDOW_LABELS[report.win] or "?")
+    if report.severity and report.severity ~= "normal" then
+      text = text .. " " .. report.severity
+    end
+    local resets = spend_age(report.resets_in)
+    if resets then
+      text = text .. " resets " .. resets
+    end
+  else
+    text = string.format("$%.2f", report.used)
+    if report.pct then
+      text = string.format("%s (%d%%)", text, report.pct)
+    end
   end
   if report.stale then
     text = "~" .. text
   end
-  local age = spend_age(report.age)
-  if age then
-    text = text .. " " .. age .. " ago"
+  if kind == "claude" then
+    local age = spend_age(report.age)
+    if age then
+      text = text .. " " .. age .. " ago"
+    end
   end
 
   spend_span = { text, spend_style(report) }
   render_status_hint()
 end
 
-local function render_spend_state(state)
+local function render_spend_state(kind, state)
   if not state then
     return
   end
   local last = state.last
-  if type(last) ~= "table" or last.used == nil then
+  if not spend_has_data(kind, last) then
     if state.last_error then
-      render_spend({ error = state.last_error })
+      render_spend(kind, { error = state.last_error })
     end
     return
   end
@@ -143,14 +186,23 @@ local function render_spend_state(state)
     report.stale = true
     report.error = state.last_error
   end
-  render_spend(report)
+  render_spend(kind, report)
 end
 
 local spend_fetching = false
 
 local function refresh_spend()
-  local state = read_spend_state()
-  render_spend_state(state)
+  local kind = spend_source()
+  if not kind then
+    if spend_span then
+      spend_span = nil
+      render_status_hint()
+    end
+    return
+  end
+  local src = SOURCES[kind]
+  local state = read_spend_state(src.state_file)
+  render_spend_state(kind, state)
   if spend_fetching or net_blocked then
     return
   end
@@ -159,12 +211,12 @@ local function refresh_spend()
   end
   spend_fetching = true
   maki.async.spawn(function()
-    local ok, err = pcall(spend.fetch)
+    local ok, err = pcall(src.fetch)
     spend_fetching = false
     if not ok then
-      maki.log.warn("claude-spend: " .. tostring(err))
+      maki.log.warn("spend: " .. tostring(err))
     end
-    render_spend_state(read_spend_state())
+    render_spend_state(kind, read_spend_state(src.state_file))
   end)
 end
 
@@ -175,7 +227,9 @@ maki.async.spawn(function()
   end
 end)
 
-maki.api.create_autocmd("TurnEnd", { callback = refresh_spend })
+maki.api.create_autocmd({ "TurnEnd", "ModelChanged", "SessionFocusChanged" }, {
+  callback = refresh_spend,
+})
 
 local function require_with_renamed_commands(module, renames)
   local original = maki.api.register_command
