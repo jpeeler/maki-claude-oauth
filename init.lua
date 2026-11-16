@@ -254,5 +254,3 @@ end
 require_with_renamed_commands("review", { ["/review"] = "/diff" })
 
 require("claude-oauth")
-
-require("program-status").setup()
